@@ -13,18 +13,18 @@ type Admins struct {
 }
 
 type User struct {
-	ID         string `gorm:"primaryKey"`
+	ID         string 
 	Name       string
-	Email      string
+	Email      string `gorm:"primaryKey"`
 	Contact    string
 	IDProof    string
 	Verified   bool
-	Membership *Membership `gorm:"foreignKey:UserID"`
+	Membership *Membership `gorm:"foreignKey:Email"`
 }
 
 type Membership struct {
 	ID        string `gorm:"primaryKey"`
-	UserID    string `gorm:"index"`
+	Email    string `gorm:"index"`
 	Type      string
 	StartDate time.Time
 	EndDate   time.Time

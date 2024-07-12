@@ -82,7 +82,7 @@ func (uu *Handler) SendOtp(c *gin.Context) {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		res, err = utils.SendOtp(input.Contact)
 		if err == nil {
-			break 
+			break
 		}
 		log.Printf("Attempt %d: Failed to send OTP to %s, error: %v", attempt, input.Contact, err)
 		time.Sleep(retryDelay)
@@ -177,7 +177,7 @@ func (uu *Handler) VerifyUser(c *gin.Context) {
 
 func (uu *Handler) PurchaseMembership(c *gin.Context) {
 	var input struct {
-		UserID         string `json:"user_id"`
+		Email          string `json:"email"`
 		MembershipType string `json:"membership_type"`
 		StartDate      string `json:"start_date"`
 		EndDate        string `json:"end_date"`
@@ -198,20 +198,27 @@ func (uu *Handler) PurchaseMembership(c *gin.Context) {
 		return
 	}
 
-	user, err := uu.Usecase.GetUserDetailsById(input.UserID)
-	if err != nil {
-		JSONResponse(c, 400, "error", nil, err, "User Not Found")
-		return
-	}
-	if !user.Verified {
-		JSONResponse(c, 400, "error", nil, nil, "User Not Found or Not Verified")
+	// user, err := uu.Usecase.GetUserDetailsById(input.UserID)
+	// if err != nil {
+	// 	JSONResponse(c, 400, "error", nil, err, "User Not Found")
+	// 	return
+	// }
+	// if !user.Verified {
+	// 	JSONResponse(c, 400, "error", nil, nil, "User Not Found or Not Verified")
 
-		return
-	}
+	// 	return
+	// }
 
 	cont := store.Session
 
-	res, err := cont.PurchaseMembership(user.Email, input.MembershipType, big.NewInt(startdate), big.NewInt(enddate))
+	verified, err := cont.VerifyUser(input.Email)
+	if err != nil {
+		JSONResponse(c, http.StatusBadRequest, "error", nil, err, "Contract error")
+		return
+	}
+	fmt.Println("res", verified)
+
+	res, err := cont.PurchaseMembership(input.Email, input.MembershipType, big.NewInt(startdate), big.NewInt(enddate))
 	if err != nil {
 		JSONResponse(c, http.StatusBadRequest, "error", nil, err, "Contract error")
 		return
@@ -234,7 +241,7 @@ func (uu *Handler) PurchaseMembership(c *gin.Context) {
 
 	membership := &models.Membership{
 		ID:        membershipEvent.MembershipId.String(),
-		UserID:    input.UserID,
+		Email:     input.Email,
 		Type:      input.MembershipType,
 		StartDate: time.Unix(startdate, 0),
 		EndDate:   time.Unix(enddate, 0),
@@ -469,20 +476,40 @@ func (uu *Handler) BulkRegisterUser(c *gin.Context) {
 		JSONResponse(c, http.StatusInternalServerError, "error", nil, err, "Failed to read CSV file")
 		return
 	}
-
+	var membership []models.Membership
 	var users []models.User
 	for _, record := range records[1:] {
 		if len(record) < 3 {
 			continue
 		}
 		user := models.User{
-			Name:    record[0],
-			Email:   record[1],
-			Contact: record[2],
-			IDProof: record[3],
+			Name:     record[0],
+			Email:    record[1],
+			Contact:  record[2],
+			IDProof:  record[3],
 			Verified: true,
 		}
+		startdate, err := utils.GetStartTime(record[5])
+		if err != nil {
+			JSONResponse(c, 400, "error", nil, err, "Time convertion error")
+			return
+		}
+
+		enddate, err := utils.GetEndTime(record[6])
+		if err != nil {
+			JSONResponse(c, 400, "error", nil, err, "Time convertion error")
+			return
+		}
+
 		users = append(users, user)
+		memberships := models.Membership{
+			Email:     record[1],
+			Type:      record[4],
+			StartDate: time.Unix(startdate, 0),
+			EndDate:   time.Unix(enddate, 0),
+			Status:    record[7],
+		}
+		membership = append(membership, memberships)
 	}
 	var txHashes []common.Hash
 	cont := store.Session
@@ -501,6 +528,37 @@ func (uu *Handler) BulkRegisterUser(c *gin.Context) {
 			JSONResponse(c, http.StatusBadRequest, "error", nil, err, "Invalid input")
 			return
 		}
+	}
+	for _, mem := range membership {
+		st := mem.StartDate.Unix()
+		ed := mem.EndDate.Unix()
+
+		res, err := cont.PurchaseMembership(mem.Email, mem.Type, big.NewInt(st), big.NewInt(ed))
+		if err != nil {
+			JSONResponse(c, http.StatusInternalServerError, "error", nil, err, fmt.Sprintf("Contract error for user %s", mem.Email))
+			return
+		}
+		tx := res.Hash()
+		var event models.MembershipPurchasedEvent
+		events, err := utils.RetrieveEvents(tx, "MembershipPurchased", event)
+		if err != nil {
+			fmt.Println("err", err)
+			JSONResponse(c, http.StatusBadRequest, "error", nil, err, "Failed to get events")
+			return
+		}
+		membershipEvent, ok := events[0].(*models.MembershipPurchasedEvent)
+		if !ok {
+			JSONResponse(c, http.StatusBadRequest, "error", nil, nil, "Event type mismatch")
+			return
+		}
+		mem.ID = membershipEvent.MembershipId.String()
+		fmt.Println("mem", mem)
+		err = uu.Usecase.PurchaseMembership(mem)
+		if err != nil {
+			JSONResponse(c, http.StatusBadRequest, "error", nil, err, "Invalid input")
+			return
+		}
+
 	}
 
 	JSONResponse(c, http.StatusOK, "success", gin.H{"txhashes": txHashes}, nil, "Users registered successfully")
@@ -534,24 +592,24 @@ func (uu *Handler) Login(c *gin.Context) {
 }
 
 func (uu *Handler) RegisterAdmin(c *gin.Context) {
-	var input struct{
-		Email string `json:"email"`
+	var input struct {
+		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		JSONResponse(c, http.StatusBadGateway, "error", nil, err, "Invalid input")
 		return
 	}
-	admin:=models.Admins{
-		Email: input.Email,
+	admin := models.Admins{
+		Email:    input.Email,
 		Password: utils.HashPassword(input.Password),
-		Role: "admin",
+		Role:     "admin",
 	}
-	err:=uu.Usecase.RegisterAdmin(admin)
-	if err != nil{
+	err := uu.Usecase.RegisterAdmin(admin)
+	if err != nil {
 		JSONResponse(c, http.StatusBadGateway, "error", nil, err, "DB Error")
 		return
 	}
-	JSONResponse(c,200,"success",nil,nil,"admin created succesfully")
+	JSONResponse(c, 200, "success", nil, nil, "admin created succesfully")
 
 }
